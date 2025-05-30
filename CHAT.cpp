@@ -16,7 +16,9 @@ enum PacketType {
     PT_PrivateMessage,
     PT_SetNickname,
     PT_UserJoined,
-    PT_UserLeft
+    PT_UserLeft,
+    PT_ListRequest,      // <<< ДОБАВЛЕНО: клиент попросил список пользователей
+    PT_ListResponse      // <<< ДОБАВЛЕНО: сервер отправляет список пользователей
 };
 
 struct ClientInfo {
@@ -27,14 +29,15 @@ struct ClientInfo {
 vector<ClientInfo> clients;
 mutex clientsMutex;
 
+// Универсальный broadcast (без фильтра)
 void broadcast(PacketType type, const string& sender, const string& target, const string& msg) {
     lock_guard<mutex> lock(clientsMutex);
     for (auto& ci : clients) {
         if (type == PT_PrivateMessage && ci.nickname != target)
             continue;
-        int nick_len = sender.size();
-        int target_len = target.size();
-        int msg_len = msg.size();
+        int nick_len = (int)sender.size();
+        int target_len = (int)target.size();
+        int msg_len = (int)msg.size();
         send(ci.socket, (char*)&type, sizeof(type), 0);
         send(ci.socket, (char*)&nick_len, sizeof(nick_len), 0);
         send(ci.socket, sender.c_str(), nick_len, 0);
@@ -43,6 +46,30 @@ void broadcast(PacketType type, const string& sender, const string& target, cons
         send(ci.socket, (char*)&msg_len, sizeof(msg_len), 0);
         send(ci.socket, msg.c_str(), msg_len, 0);
     }
+}
+
+// Отправить список пользователей одному клиенту
+void sendUserList(SOCKET s) {
+    string list;
+    {
+        lock_guard<mutex> lock(clientsMutex);
+        for (auto& c : clients) {
+            if (!c.nickname.empty()) {
+                list += c.nickname + "\n";
+            }
+        }
+    }
+    PacketType type = PT_ListResponse;
+    int sender_len = 0;           // мы можем оставить sender пустым
+    int target_len = 0;           // не нужно
+    int msg_len = (int)list.size();
+    send(s, (char*)&type, sizeof(type), 0);
+    send(s, (char*)&sender_len, sizeof(sender_len), 0);
+    // sender отсутствует
+    send(s, (char*)&target_len, sizeof(target_len), 0);
+    // target отсутствует
+    send(s, (char*)&msg_len, sizeof(msg_len), 0);
+    send(s, list.c_str(), msg_len, 0);
 }
 
 void handleClient(ClientInfo ci) {
@@ -65,6 +92,9 @@ void handleClient(ClientInfo ci) {
                     if (c.socket == s) { c.nickname = nickname; break; }
             }
             broadcast(PT_UserJoined, nickname, "", nickname + " joined the chat.");
+        }
+        else if (type == PT_ListRequest) {         // <<< ДОБАВЛЕНО: запрос списка юзеров
+            sendUserList(s);
         }
         else if (type == PT_Message || type == PT_PrivateMessage) {
             int len;
@@ -139,6 +169,7 @@ int main() {
     return 0;
 }
 
+
 //client.cpp
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 #include <winsock2.h>
@@ -208,7 +239,15 @@ void printPrivateMessage(const string& sender, const string& target, const strin
     setColor(COLOR_DEFAULT);
 }
 
-enum PacketType { PT_Message, PT_PrivateMessage, PT_SetNickname, PT_UserJoined, PT_UserLeft };
+enum PacketType {
+    PT_Message,
+    PT_PrivateMessage,
+    PT_SetNickname,
+    PT_UserJoined,
+    PT_UserLeft,
+    PT_ListRequest,    // <<< ДОБАВЛЕНО
+    PT_ListResponse    // <<< ДОБАВЛЕНО
+};
 
 void recvThread(SOCKET s) {
     while (true) {
@@ -216,15 +255,20 @@ void recvThread(SOCKET s) {
         int ret = recv(s, (char*)&type, sizeof(type), 0);
         if (ret <= 0) break;
 
-        int nl; recv(s, (char*)&nl, sizeof(nl), 0);
-        string sender(nl, '\0'); recv(s, &sender[0], nl, 0);
+        int nl;
+        recv(s, (char*)&nl, sizeof(nl), 0);
+        string sender(nl, '\0');
+        if (nl) recv(s, &sender[0], nl, 0);
 
-        int tl; recv(s, (char*)&tl, sizeof(tl), 0);
+        int tl;
+        recv(s, (char*)&tl, sizeof(tl), 0);
         string target(tl, '\0');
         if (tl) recv(s, &target[0], tl, 0);
 
-        int ml; recv(s, (char*)&ml, sizeof(ml), 0);
-        string msg(ml, '\0'); recv(s, &msg[0], ml, 0);
+        int ml;
+        recv(s, (char*)&ml, sizeof(ml), 0);
+        string msg(ml, '\0');
+        if (ml) recv(s, &msg[0], ml, 0);
 
         switch (type) {
         case PT_Message:
@@ -236,6 +280,9 @@ void recvThread(SOCKET s) {
         case PT_UserJoined:
         case PT_UserLeft:
             printSystem(msg);
+            break;
+        case PT_ListResponse:    // <<< ДОБАВЛЕНО: сервер прислал список
+            printSystem("Online users:\n" + msg);
             break;
         }
     }
@@ -251,7 +298,7 @@ int main() {
     SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in addr;
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr("192.168.212.39");
+    addr.sin_addr.s_addr = inet_addr("192.168.0.17");
     addr.sin_port = htons(12345);
     if (connect(s, (sockaddr*)&addr, sizeof(addr)) != 0) {
         cerr << "Unable to connect to server\n";
@@ -264,7 +311,7 @@ int main() {
     getline(cin, nick);
 
     PacketType pt = PT_SetNickname;
-    int nl = nick.size();
+    int nl = (int)nick.size();
     send(s, (char*)&pt, sizeof(pt), 0);
     send(s, (char*)&nl, sizeof(nl), 0);
     send(s, nick.c_str(), nl, 0);
@@ -280,13 +327,25 @@ int main() {
             closesocket(s);
             break;
         }
-        if (line.rfind("/pm ", 0) == 0) {
+        else if (line == "/list") {        // <<< ДОБАВЛЕНО: если пользователь ввёл /list
+            pt = PT_ListRequest;
+            int zero = 0;                   // sender и target нам не нужны
+            send(s, (char*)&pt, sizeof(pt), 0);
+            send(s, (char*)&zero, sizeof(zero), 0);
+            // не отправляем sender
+            send(s, (char*)&zero, sizeof(zero), 0);
+            // не отправляем target
+            send(s, (char*)&zero, sizeof(zero), 0);
+            // не отправляем msg
+        }
+        else if (line.rfind("/pm ", 0) == 0) {
             size_t pos = line.find(' ', 4);
             string tgt = line.substr(4, pos - 4);
             string m = line.substr(pos + 1);
 
             pt = PT_PrivateMessage;
-            int tl = tgt.size(), ml = m.size();
+            int tl = (int)tgt.size();
+            int ml = (int)m.size();
             send(s, (char*)&pt, sizeof(pt), 0);
             send(s, (char*)&nl, sizeof(nl), 0);
             send(s, nick.c_str(), nl, 0);
@@ -297,11 +356,12 @@ int main() {
         }
         else {
             pt = PT_Message;
-            int ml = line.size(), zero = 0;
+            int ml = (int)line.size();
+            int zero = 0;
             send(s, (char*)&pt, sizeof(pt), 0);
             send(s, (char*)&nl, sizeof(nl), 0);
             send(s, nick.c_str(), nl, 0);
-            send(s, (char*)&zero, sizeof(zero), 0);
+            send(s, (char*)&zero, sizeof(zero), 0); // target = ""
             send(s, (char*)&ml, sizeof(ml), 0);
             send(s, line.c_str(), ml, 0);
         }
